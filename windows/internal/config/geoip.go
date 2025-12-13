@@ -1,4 +1,4 @@
-// internal/config/geoip.go
+// windows/internal/config/geoip.go
 
 package config
 

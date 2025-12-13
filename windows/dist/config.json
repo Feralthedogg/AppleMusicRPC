@@ -1,7 +1,7 @@
 {
   "discord_app_id": "1448904782986219562",
   "large_image": "",
-  "large_text": "Apple Music",
+  "large_text": "AppleMusicRPC",
   "prefer_sources": ["AppleMusic"],
   "poll_ms": 1200,
   "use_album_art": true,

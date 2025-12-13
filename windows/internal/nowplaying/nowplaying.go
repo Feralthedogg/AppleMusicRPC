@@ -1,4 +1,4 @@
-// internal/nowplaying/nowplaying.go
+// windows/internal/nowplaying/nowplaying.go
 //
 // Package nowplaying defines the common model and interface used to retrieve
 // "now playing" metadata from different backends (e.g., Windows SMTC).

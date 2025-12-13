@@ -1,6 +1,6 @@
 //go:build windows
 
-// internal/discordrpc/discordrpc_windows.go
+// windows/internal/discordrpc/discordrpc_windows.go
 //
 // Windows-only Discord Rich Presence over Discord IPC named pipes.
 //
@@ -9,7 +9,10 @@
 // - framed JSON read/write
 // - SET_ACTIVITY to publish a Listening activity
 //
-// Album-related UI is intentionally removed (no album button, no album state).
+// UI notes:
+// - We use "details" as the top (bold) line (TITLE only).
+// - We use "state" as the second line (ARTIST and optionally ALBUM).
+// - Only one button is used ("Play On Apple Music").
 package discordrpc
 
 import (
@@ -21,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -82,6 +86,7 @@ func (r *RPC) connect() error {
 			continue
 		}
 
+		// Best-effort: discard handshake response.
 		_, _, _ = r.read()
 		return nil
 	}
@@ -128,15 +133,34 @@ type activityButton struct {
 type activity struct {
 	Name       string              `json:"name"`
 	Type       int                 `json:"type,omitempty"`
-	Details    string              `json:"details,omitempty"`
+	Details    string              `json:"details,omitempty"` // Top (bold) line
+	State      string              `json:"state,omitempty"`   // Second line
 	Timestamps *activityTimestamps `json:"timestamps,omitempty"`
 	Assets     *activityAssets     `json:"assets,omitempty"`
 	Buttons    []activityButton    `json:"buttons,omitempty"`
 }
 
+// buildState constructs the second line text.
+// - If both are present: "Artist • Album"
+// - If only artist: "Artist"
+// - If only album: "Album"
+func buildState(artist, album string) string {
+	artist = strings.TrimSpace(artist)
+	album = strings.TrimSpace(album)
+
+	if artist != "" && album != "" {
+		return artist + " • " + album
+	}
+	if artist != "" {
+		return artist
+	}
+	return album
+}
+
 // SetPlaying publishes a Listening activity with a progress bar.
-// Album-related UI is removed; only one button is used ("Play On Apple Music").
-func (r *RPC) SetPlaying(artist, title, _album string, pos, dur time.Duration, coverURL, trackURL, _albumURL string) error {
+// - details: title only
+// - state: artist (+ album)
+func (r *RPC) SetPlaying(artist, title, album string, pos, dur time.Duration, coverURL, trackURL, _albumURL string) error {
 	if err := r.ensure(); err != nil {
 		return err
 	}
@@ -149,6 +173,7 @@ func (r *RPC) SetPlaying(artist, title, _album string, pos, dur time.Duration, c
 		end := start.Add(dur)
 		ts = &activityTimestamps{Start: start.Unix(), End: end.Unix()}
 	} else {
+		// If duration unknown, sending only start still gives a "started at" style timestamp.
 		ts = &activityTimestamps{Start: start.Unix()}
 	}
 
@@ -169,7 +194,8 @@ func (r *RPC) SetPlaying(artist, title, _album string, pos, dur time.Duration, c
 	a := &activity{
 		Name:       r.activityName,
 		Type:       r.activityType,
-		Details:    fmt.Sprintf("%s - %s", artist, title),
+		Details:    strings.TrimSpace(title),  // TITLE only
+		State:      buildState(artist, album), // ARTIST (+ ALBUM)
 		Timestamps: ts,
 		Assets:     &activityAssets{LargeImage: large, LargeText: lt},
 		Buttons:    btns,
@@ -178,7 +204,9 @@ func (r *RPC) SetPlaying(artist, title, _album string, pos, dur time.Duration, c
 }
 
 // SetPaused publishes a non-progressing activity (timestamps omitted).
-func (r *RPC) SetPaused(artist, title, _album string, coverURL, trackURL, _albumURL string) error {
+// - details: title only
+// - state: artist (+ album)
+func (r *RPC) SetPaused(artist, title, album string, coverURL, trackURL, _albumURL string) error {
 	if err := r.ensure(); err != nil {
 		return err
 	}
@@ -200,7 +228,8 @@ func (r *RPC) SetPaused(artist, title, _album string, coverURL, trackURL, _album
 	a := &activity{
 		Name:    r.activityName,
 		Type:    r.activityType,
-		Details: fmt.Sprintf("%s - %s", artist, title),
+		Details: strings.TrimSpace(title),  // TITLE only
+		State:   buildState(artist, album), // ARTIST (+ ALBUM)
 		Assets:  &activityAssets{LargeImage: large, LargeText: lt},
 		Buttons: btns,
 	}
@@ -220,6 +249,7 @@ func (r *RPC) setActivity(a *activity) error {
 	}
 
 	if err := r.write(opFrame, payload); err != nil {
+		// If pipe broke, reconnect once and retry.
 		r.Close()
 		if err2 := r.connect(); err2 != nil {
 			return err
@@ -229,6 +259,7 @@ func (r *RPC) setActivity(a *activity) error {
 		}
 	}
 
+	// Best-effort: discard response (Discord replies with a frame).
 	_, _, _ = r.read()
 	return nil
 }

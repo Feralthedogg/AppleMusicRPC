@@ -1,6 +1,6 @@
 //go:build windows
 
-// internal/config/secure_windows.go
+// windows/internal/config/secure_windows.go
 //
 // Windows-only secure config loader/saver using DPAPI.
 //

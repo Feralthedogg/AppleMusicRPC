@@ -1,6 +1,6 @@
 //go:build windows
 
-// internal/ui/msgbox_windows.go
+// windows/internal/ui/msgbox_windows.go
 //
 // Windows-only UI helpers.
 //

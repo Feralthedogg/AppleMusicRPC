@@ -1,6 +1,18 @@
-// internal/nowplaying/smtcwinrt/smtcwinrt_windows.go
 //go:build windows
 
+// windows/internal/nowplaying/smtcwinrt/smtcwinrt_windows.go
+//
+// SMTC (GlobalSystemMediaTransportControls) WinRT provider for Windows.
+//
+// This provider polls the current media session and returns a nowplaying.Track.
+//
+// Key points:
+//   - Reads media metadata from GlobalSystemMediaTransportControlsSessionMediaProperties
+//     (Title / Artist / AlbumArtist / AlbumTitle).
+//   - Reads playback timeline from GlobalSystemMediaTransportControlsSessionTimelineProperties
+//     (StartTime / EndTime / Position).
+//   - Some sources/apps populate AlbumArtist instead of Artist; we fall back accordingly.
+//   - Timeline Position getter must be vtable index 10 (NOT 8).
 package smtcwinrt
 
 import (
@@ -78,7 +90,7 @@ func (o *comObj) release() {
 	if o.isNil() {
 		return
 	}
-	_ = o.call(2)
+	_ = o.call(2) // IUnknown::Release
 	o.ptr = 0
 }
 
@@ -99,7 +111,7 @@ func releaseClose(o *comObj) {
 		return
 	}
 	if c, hr := o.queryInterface(&iidClosable); hr == 0 && c != nil {
-		_ = c.call(6)
+		_ = c.call(6) // IClosable.Close
 		c.release()
 	}
 	o.release()
@@ -191,7 +203,7 @@ func waitAsync(op *comObj, timeout time.Duration) (*comObj, error) {
 	var st uint32
 
 	for {
-		hr2 := ai.call(7, uintptr(unsafe.Pointer(&st)))
+		hr2 := ai.call(7, uintptr(unsafe.Pointer(&st))) // IAsyncInfo.Status
 		if hr2 != 0 {
 			return nil, fmt.Errorf("IAsyncInfo.Status hr=0x%08X", uint32(hr2))
 		}
@@ -206,12 +218,12 @@ func waitAsync(op *comObj, timeout time.Duration) (*comObj, error) {
 
 	if st != asyncStatusCompleted {
 		var ec uint32
-		_ = ai.call(8, uintptr(unsafe.Pointer(&ec)))
+		_ = ai.call(8, uintptr(unsafe.Pointer(&ec))) // IAsyncInfo.ErrorCode
 		return nil, fmt.Errorf("async status=%d error=0x%08X", st, ec)
 	}
 
 	var res uintptr
-	hr3 := op.call(8, uintptr(unsafe.Pointer(&res)))
+	hr3 := op.call(8, uintptr(unsafe.Pointer(&res))) // GetResults
 	if hr3 != 0 || res == 0 {
 		return nil, fmt.Errorf("GetResults hr=0x%08X", uint32(hr3))
 	}
@@ -241,7 +253,7 @@ func New(prefer []string) (*Provider, bool) {
 	}
 
 	var async uintptr
-	hr := statics.call(6, uintptr(unsafe.Pointer(&async)))
+	hr := statics.call(6, uintptr(unsafe.Pointer(&async))) // RequestAsync
 	statics.release()
 	if hr != 0 || async == 0 {
 		roUninitialize()
@@ -295,7 +307,7 @@ func (p *Provider) preferMatch(appid string) bool {
 
 func (p *Provider) getSourceAppId(session *comObj) string {
 	var hs uintptr
-	_ = session.call(6, uintptr(unsafe.Pointer(&hs)))
+	_ = session.call(6, uintptr(unsafe.Pointer(&hs))) // get_SourceAppUserModelId
 	if hs == 0 {
 		return ""
 	}
@@ -309,9 +321,10 @@ func (p *Provider) pickSession() (*comObj, string) {
 		return nil, ""
 	}
 
+	// Try the current session first.
 	{
 		var sess uintptr
-		hr := p.manager.call(6, uintptr(unsafe.Pointer(&sess)))
+		hr := p.manager.call(6, uintptr(unsafe.Pointer(&sess))) // GetCurrentSession
 		if hr == 0 && sess != 0 {
 			s := &comObj{ptr: sess}
 			appid := p.getSourceAppId(s)
@@ -322,8 +335,9 @@ func (p *Provider) pickSession() (*comObj, string) {
 		}
 	}
 
+	// Otherwise enumerate all sessions.
 	var list uintptr
-	hr := p.manager.call(7, uintptr(unsafe.Pointer(&list)))
+	hr := p.manager.call(7, uintptr(unsafe.Pointer(&list))) // GetSessions
 	if hr != 0 || list == 0 {
 		return nil, ""
 	}
@@ -331,11 +345,11 @@ func (p *Provider) pickSession() (*comObj, string) {
 	defer lv.release()
 
 	var count int32
-	_ = lv.call(7, uintptr(unsafe.Pointer(&count)))
+	_ = lv.call(7, uintptr(unsafe.Pointer(&count))) // get_Size
 
 	for i := int32(0); i < count; i++ {
 		var sess uintptr
-		_ = lv.call(6, uintptr(i), uintptr(unsafe.Pointer(&sess)))
+		_ = lv.call(6, uintptr(i), uintptr(unsafe.Pointer(&sess))) // GetAt
 		if sess == 0 {
 			continue
 		}
@@ -362,7 +376,7 @@ func (p *Provider) Poll() (nowplaying.Track, bool, error) {
 	defer sess.release()
 
 	var mediaAsync uintptr
-	hr := sess.call(7, uintptr(unsafe.Pointer(&mediaAsync)))
+	hr := sess.call(7, uintptr(unsafe.Pointer(&mediaAsync))) // TryGetMediaPropertiesAsync
 	if hr != 0 || mediaAsync == 0 {
 		return nowplaying.Track{}, false, nil
 	}
@@ -384,19 +398,44 @@ func (p *Provider) Poll() (nowplaying.Track, bool, error) {
 		return s
 	}
 
-	// Only title and artist are used (album intentionally removed).
+	// GlobalSystemMediaTransportControlsSessionMediaProperties
+	//
+	// WinRT vtable layout (after IInspectable 0..5):
+	//  6  = get_Title
+	//  7  = get_Subtitle
+	//  8  = get_Artist
+	//  9  = get_AlbumArtist
+	// 10  = get_AlbumTitle
+
 	title := getStr(6)
-	artist := getStr(9)
+	subtitle := getStr(7)
+
+	artist := getStr(8)
+	albumArtist := getStr(9)
+	if strings.TrimSpace(artist) == "" {
+		artist = albumArtist
+	}
+
+	album := getStr(10)
+
+	// Fallback: some providers/apps put album title in Subtitle instead of AlbumTitle.
+	// Only use Subtitle if it's not empty and not equal to artist.
+	if strings.TrimSpace(album) == "" {
+		ss := strings.TrimSpace(subtitle)
+		if ss != "" && !strings.EqualFold(ss, strings.TrimSpace(artist)) {
+			album = ss
+		}
+	}
 
 	st := nowplaying.Stopped
 	{
 		var pb uintptr
-		if sess.call(9, uintptr(unsafe.Pointer(&pb))) == 0 && pb != 0 {
+		if sess.call(9, uintptr(unsafe.Pointer(&pb))) == 0 && pb != 0 { // get_PlaybackInfo
 			pi := &comObj{ptr: pb}
 			defer pi.release()
 
 			var ps int32
-			_ = pi.call(7, uintptr(unsafe.Pointer(&ps)))
+			_ = pi.call(7, uintptr(unsafe.Pointer(&ps))) // get_PlaybackStatus
 			switch ps {
 			case 4:
 				st = nowplaying.Playing
@@ -411,7 +450,7 @@ func (p *Provider) Poll() (nowplaying.Track, bool, error) {
 	var pos, dur time.Duration
 	{
 		var tl uintptr
-		if sess.call(8, uintptr(unsafe.Pointer(&tl))) == 0 && tl != 0 {
+		if sess.call(8, uintptr(unsafe.Pointer(&tl))) == 0 && tl != 0 { // get_TimelineProperties
 			tlo := &comObj{ptr: tl}
 			defer tlo.release()
 
@@ -424,11 +463,11 @@ func (p *Provider) Poll() (nowplaying.Track, bool, error) {
 			// 7      = get_EndTime
 			// 8      = get_MinSeekTime
 			// 9      = get_MaxSeekTime
-			// 10     = get_Position   <-- this is the one we actually need
+			// 10     = get_Position   <-- correct getter index
 			var startTicks, endTicks, posTicks int64
 			_ = tlo.call(6, uintptr(unsafe.Pointer(&startTicks)))
 			_ = tlo.call(7, uintptr(unsafe.Pointer(&endTicks)))
-			_ = tlo.call(10, uintptr(unsafe.Pointer(&posTicks))) // FIX: Position (was wrongly reading index 8)
+			_ = tlo.call(10, uintptr(unsafe.Pointer(&posTicks))) // correct Position getter
 
 			// Duration: End - Start
 			dt := endTicks - startTicks
@@ -437,7 +476,7 @@ func (p *Provider) Poll() (nowplaying.Track, bool, error) {
 			}
 			dur = ticksToDuration(dt)
 
-			// Position should be relative to StartTime
+			// Position is relative to StartTime
 			pt := posTicks - startTicks
 			if pt < 0 {
 				pt = 0
@@ -456,7 +495,7 @@ func (p *Provider) Poll() (nowplaying.Track, bool, error) {
 		Status:   st,
 		Title:    title,
 		Artist:   artist,
-		Album:    "", // album removed
+		Album:    album,
 		Position: pos,
 		Duration: dur,
 	}

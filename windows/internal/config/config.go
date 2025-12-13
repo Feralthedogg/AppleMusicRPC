@@ -1,4 +1,4 @@
-// internal/config/config.go
+// windows/internal/config/config.go
 //
 // Package config provides configuration loading for the application.
 // This file implements loading a JSON config located next to the executable.

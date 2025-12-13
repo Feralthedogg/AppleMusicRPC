@@ -1,10 +1,31 @@
 //go:build windows
 
+// windows/cmd/amrpc/main.go
+//
+// AppleMusicRPC (Windows)
+//
+// - Runs as a tray/background app
+// - Reads now-playing info via SMTC (WinRT)
+// - Publishes Discord Rich Presence via Discord IPC
+//
+// UI goal:
+// - Details (big line): Title only
+// - State   (small line): Artist • Album
+//
+// Session selection goal:
+// - Default to Apple Music only (avoid switching to YouTube/Chrome when Apple Music stops)
+//
+// Config loading:
+// - Prefer ProgramData (MSI install):   C:\ProgramData\Feralthedogg\AppleMusicRPC\config.json
+// - Fallback to beside executable:      <exe_dir>\config.json
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -27,7 +48,6 @@ var (
 
 // detachConsole detaches this process from the current console (if any).
 // This makes the app behave like a background/tray app even when launched from a terminal.
-// Note: If the process has no console, FreeConsole simply fails; we ignore it.
 func detachConsole() {
 	_, _, _ = procFreeConsole.Call()
 }
@@ -52,10 +72,28 @@ func cleanArtist(artist string) string {
 	return artist
 }
 
+// cleanAlbum normalizes album text.
+// If album is empty or meaningless, return "" so Discord shows artist only.
+func cleanAlbum(album string) string {
+	album = normalizeText(album)
+
+	// Treat these as "no album"
+	switch strings.ToLower(album) {
+	case "", "unknown album", "unknown", "single":
+		return ""
+	}
+	return album
+}
+
 // sameTrack determines whether two tracks represent the same "identity" for presence.
-// Album is intentionally ignored (the UI removed album usage).
+// We intentionally ignore Album here so we don't treat late/unstable album metadata as a new track.
 func sameTrack(a, b nowplaying.Track) bool {
 	return a.Title == b.Title && a.Artist == b.Artist && a.Source == b.Source
+}
+
+// trackKey binds iTunes meta to a specific track identity (prevents cross-track contamination).
+func trackKey(t nowplaying.Track) string {
+	return t.Source + "\n" + t.Artist + "\n" + t.Title
 }
 
 func absDur(d time.Duration) time.Duration {
@@ -74,6 +112,39 @@ func clampDur(v, lo, hi time.Duration) time.Duration {
 		return hi
 	}
 	return v
+}
+
+// loadConfig tries ProgramData first (for MSI installs), then falls back to config.json near the exe.
+func loadConfig() (config.Config, error) {
+	// Defaults (keep in sync with config.LoadNearExe defaults).
+	cfg := config.Config{
+		PollMS:         1200,
+		LargeText:      "Apple Music",
+		UseAlbumArt:    true,
+		ShowPaused:     true,
+		ForceRefreshMS: 0,
+	}
+
+	// 1) ProgramData\Feralthedogg\AppleMusicRPC\config.json
+	if pd := os.Getenv("ProgramData"); pd != "" {
+		p := filepath.Join(pd, "Feralthedogg", "AppleMusicRPC", "config.json")
+		if b, err := os.ReadFile(p); err == nil {
+			if err := json.Unmarshal(b, &cfg); err != nil {
+				return cfg, fmt.Errorf("parse %s: %w", p, err)
+			}
+			// sanitize
+			if cfg.PollMS <= 0 {
+				cfg.PollMS = 1200
+			}
+			if cfg.LargeText == "" {
+				cfg.LargeText = "Apple Music"
+			}
+			return cfg, nil
+		}
+	}
+
+	// 2) Fallback: config.json near exe (portable mode)
+	return config.LoadNearExe()
 }
 
 func main() {
@@ -96,15 +167,22 @@ func main() {
 	}
 	// --------------------------------------
 
-	// Load configuration (DPAPI-encrypted config.enc preferred; fallback to config.json on first run).
-	cfg, err := config.LoadNearExeSecure()
+	// Load configuration (config.json).
+	cfg, err := loadConfig()
 	if err != nil {
-		ui.Error("Apple Music RPC", "Failed to load configuration file (config.enc / config.json):\n"+err.Error())
+		ui.Error("Apple Music RPC", "Failed to load configuration file (config.json):\n"+err.Error())
 		return
 	}
 	if cfg.DiscordAppID == "" {
-		ui.Error("Apple Music RPC", "DiscordAppID is empty.")
+		ui.Error("Apple Music RPC", "discord_app_id is empty.")
 		return
+	}
+
+	// Prefer sources:
+	// If prefer_sources is empty, default to Apple Music only to avoid switching to YouTube/Chrome sessions.
+	prefer := cfg.PreferSources
+	if len(prefer) == 0 {
+		prefer = []string{"applemusic"} // substring match against SourceAppUserModelId
 	}
 
 	// Determine storefront country for iTunes Search API.
@@ -127,7 +205,7 @@ func main() {
 	}
 
 	// Initialize SMTC provider (WinRT).
-	prov, ok := smtcwinrt.New(cfg.PreferSources)
+	prov, ok := smtcwinrt.New(prefer)
 	if !ok {
 		ui.Error("Apple Music RPC", "SMTC WinRT provider init failed.")
 		return
@@ -174,6 +252,12 @@ func main() {
 
 			// Avoid spamming Discord IPC while scrubbing.
 			updateThrottle = 250 * time.Millisecond
+
+			// Retry iTunes meta when cover is missing (prevents "sometimes Apple icon").
+			metaRetryInterval = 5 * time.Second
+
+			// iTunes lookup timeout (1500ms is too tight sometimes).
+			itunesTimeout = 2500 * time.Millisecond
 		)
 
 		var last nowplaying.Track
@@ -199,6 +283,8 @@ func main() {
 		// Bookkeeping for throttling and for iTunes duration fallback.
 		var lastUpdated time.Time
 		var lastMeta artwork.Meta
+		var lastMetaKey string
+		var lastLookupAt time.Time
 		var lastSentDur time.Duration
 
 		// No-session debounce timer.
@@ -221,6 +307,8 @@ func main() {
 
 			lastUpdated = time.Time{}
 			lastMeta = artwork.Meta{}
+			lastMetaKey = ""
+			lastLookupAt = time.Time{}
 			lastSentDur = 0
 
 			noSessionSince = time.Time{}
@@ -257,6 +345,7 @@ func main() {
 
 			case <-pollTicker.C:
 				now := time.Now()
+				metaUpdated := false
 
 				t, ok, err := prov.Poll()
 				if err != nil {
@@ -286,7 +375,7 @@ func main() {
 				tClean := t
 				tClean.Title = normalizeText(tClean.Title)
 				tClean.Artist = cleanArtist(tClean.Artist)
-				tClean.Album = "" // album intentionally removed
+				tClean.Album = cleanAlbum(tClean.Album)
 
 				// If metadata is empty, treat as unusable session (debounce via noSessionSince).
 				if tClean.Title == "" && tClean.Artist == "" {
@@ -303,22 +392,60 @@ func main() {
 				}
 
 				trackChanged := !sameTrack(last, tClean)
+				keyNow := trackKey(tClean)
 
-				// iTunes lookup only when the track identity changes.
+				// Track boundary: reset meta binding immediately (prevents cross-track album/cover bleed).
+				if trackChanged {
+					lastMeta = artwork.Meta{}
+					lastMetaKey = ""
+					lastLookupAt = time.Time{}
+				}
+
+				// ---- iTunes lookup on track change ----
 				if trackChanged && it != nil {
-					ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-					m, ok := it.Lookup(ctx, tClean.Title, tClean.Artist)
+					ctx, cancel := context.WithTimeout(context.Background(), itunesTimeout)
+					m, ok := it.Lookup(ctx, tClean.Title, tClean.Artist, tClean.Album, tClean.Duration)
 					cancel()
+
+					lastLookupAt = now
 					if ok {
 						lastMeta = m
-					} else {
-						lastMeta = artwork.Meta{}
+						lastMetaKey = keyNow
+						metaUpdated = true
 					}
 				}
 
+				// Album fallback only if meta belongs to this exact track.
+				if tClean.Album == "" && lastMetaKey == keyNow && lastMeta.Album != "" {
+					tClean.Album = cleanAlbum(lastMeta.Album)
+				}
+
+				// ---- Retry meta if cover is missing (fixes "sometimes Apple icon") ----
+				if it != nil && effectiveStatus == nowplaying.Playing {
+					needRetry := (lastMetaKey != keyNow) || (lastMetaKey == keyNow && lastMeta.CoverURL == "")
+					if needRetry && (lastLookupAt.IsZero() || now.Sub(lastLookupAt) >= metaRetryInterval) {
+						ctx, cancel := context.WithTimeout(context.Background(), itunesTimeout)
+						m, ok := it.Lookup(ctx, tClean.Title, tClean.Artist, tClean.Album, tClean.Duration)
+						cancel()
+
+						lastLookupAt = now
+						if ok {
+							lastMeta = m
+							lastMetaKey = keyNow
+
+							if tClean.Album == "" && m.Album != "" {
+								tClean.Album = cleanAlbum(m.Album)
+							}
+							metaUpdated = true
+						}
+					}
+				}
+
+				albumChanged := (tClean.Album != last.Album) // allow late album metadata to update UI
+
 				// Duration preference: provider duration -> iTunes duration -> last sent duration.
 				durForRPC := tClean.Duration
-				if durForRPC <= 0 && lastMeta.Duration > 0 {
+				if durForRPC <= 0 && lastMetaKey == keyNow && lastMeta.Duration > 0 {
 					durForRPC = lastMeta.Duration
 				}
 				if durForRPC <= 0 && lastSentDur > 0 {
@@ -400,8 +527,6 @@ func main() {
 				}
 
 				// Conservative seek detection:
-				// - Ignore early settling window.
-				// - Require confirmation for small jumps.
 				seek := false
 				if effectiveStatus == nowplaying.Playing && haveAnchor && !trackChanged && rawValid {
 					if anchoredPos >= ignoreSeekBefore {
@@ -443,7 +568,7 @@ func main() {
 				posForRPC := anchoredPosNow(now, durForRPC)
 
 				// Decide whether to send an IPC update.
-				need := trackChanged || lastStatus != effectiveStatus || reAnchored
+				need := trackChanged || albumChanged || lastStatus != effectiveStatus || reAnchored || metaUpdated
 
 				if effectiveStatus == nowplaying.Playing {
 					// If duration becomes known later, resend so progress bar appears.
@@ -456,24 +581,45 @@ func main() {
 					}
 				}
 
-				// Throttle updates to reduce IPC spam, but never throttle track change or re-anchor.
-				if need && !trackChanged && !reAnchored && lastStatus == effectiveStatus {
+				// Throttle updates to reduce IPC spam, but never throttle track change or re-anchor/meta update.
+				if need && !trackChanged && !reAnchored && !metaUpdated && lastStatus == effectiveStatus {
 					if time.Since(lastUpdated) < updateThrottle {
 						need = false
 					}
 				}
 
+				coverURL := ""
+				trackURL := ""
+				if lastMetaKey == keyNow {
+					coverURL = lastMeta.CoverURL
+					trackURL = lastMeta.TrackURL
+				}
+
 				if need {
 					switch effectiveStatus {
 					case nowplaying.Playing:
-						_ = rpc.SetPlaying(tClean.Artist, tClean.Title, "", posForRPC, durForRPC,
-							lastMeta.CoverURL, lastMeta.TrackURL, "")
+						_ = rpc.SetPlaying(
+							tClean.Artist,
+							tClean.Title,
+							tClean.Album, // state line: Artist • Album (or Artist only)
+							posForRPC,
+							durForRPC,
+							coverURL,
+							trackURL,
+							"",
+						)
 						if durForRPC > 0 {
 							lastSentDur = durForRPC
 						}
 					case nowplaying.Paused:
-						_ = rpc.SetPaused(tClean.Artist, tClean.Title, "",
-							lastMeta.CoverURL, lastMeta.TrackURL, "")
+						_ = rpc.SetPaused(
+							tClean.Artist,
+							tClean.Title,
+							tClean.Album,
+							coverURL,
+							trackURL,
+							"",
+						)
 					}
 					lastUpdated = now
 				}

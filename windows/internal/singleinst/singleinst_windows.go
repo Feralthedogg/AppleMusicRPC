@@ -1,6 +1,6 @@
 //go:build windows
 
-// internal/singleinst/singleinst_windows.go
+// windows/internal/singleinst/singleinst_windows.go
 //
 // Windows-only single-instance lock using a named mutex.
 //
