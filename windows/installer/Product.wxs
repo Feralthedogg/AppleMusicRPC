@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Package
+    Name="AppleMusicRPC"
+    Manufacturer="Feralthedogg"
+    Version="1.0.0"
+    Language="1033"
+    Codepage="65001"
+    InstallerVersion="500"
+    Scope="perMachine"
+    UpgradeCode="{760D2004-1A83-4D59-9D54-130A47FEDCDC}"
+    ProductCode="{D0A0E8B1-B1E7-4B3A-88D9-3A5E0AE5B24F}">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of AppleMusicRPC is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <util:QueryWindowsWellKnownSIDs />
+
+    <util:CloseApplication Id="CloseAppleMusicRPC"
+                          Target="AppleMusicRPC.exe"
+                          RebootPrompt="no"
+                          TerminateProcess="0" />
+
+    <Icon Id="AppIcon" SourceFile="..\dist\amrpc.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="DIR_COMPANY" Name="!(bind.Property.Manufacturer)">
+        <Directory Id="INSTALLFOLDER" Name="AppleMusicRPC" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="PD_COMPANY" Name="!(bind.Property.Manufacturer)">
+        <Directory Id="PD_APP" Name="AppleMusicRPC" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="PM_COMPANY" Name="!(bind.Property.Manufacturer)">
+        <Directory Id="PM_APP" Name="AppleMusicRPC" />
+      </Directory>
+    </StandardDirectory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="cmp_main"
+                 Guid="{CD052222-A29E-4303-852D-580A30E7DF5F}"
+                 Bitness="always64">
+
+        <File Id="fil_exe" Source="..\dist\AppleMusicRPC.exe" KeyPath="yes" />
+
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Microsoft\Windows\CurrentVersion\Run"
+          Name="AppleMusicRPC"
+          Value="&quot;[#fil_exe]&quot;"
+          Type="string" />
+
+        <RemoveFile Id="rm_install_all" Name="*.*" On="uninstall" Directory="INSTALLFOLDER" />
+        <RemoveFolder Id="rm_installfolder" Directory="INSTALLFOLDER" On="uninstall" />
+        <RemoveFolder Id="rm_company_pf" Directory="DIR_COMPANY" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="PD_APP">
+      <Component Id="cmp_config"
+                 Guid="{92EBA4EB-A792-4870-BF0F-14F24477E978}"
+                 Bitness="always64">
+
+        <CreateFolder>
+          <util:PermissionEx User="[WIX_ACCOUNT_USERS]" GenericAll="yes" />
+        </CreateFolder>
+
+        <File Id="fil_config_json" Source="..\dist\config.json" KeyPath="yes" />
+
+        <RemoveFile Id="rm_pd_all" Name="*.*" On="uninstall" Directory="PD_APP" />
+        <RemoveFolder Id="rm_pd_app" Directory="PD_APP" On="uninstall" />
+        <RemoveFolder Id="rm_pd_company" Directory="PD_COMPANY" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="PM_APP">
+      <Component Id="cmp_shortcuts"
+                 Guid="{1B4D4F50-9F3A-4BDE-8E62-1D8A0A8A0D0A}"
+                 Bitness="always64">
+
+        <CreateFolder />
+
+        <Shortcut
+          Id="sc_app"
+          Name="AppleMusicRPC"
+          Description="Apple Music → Discord Rich Presence"
+          Target="[#fil_exe]"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="AppIcon"
+          IconIndex="0" />
+
+        <Shortcut
+          Id="sc_uninstall"
+          Name="Uninstall AppleMusicRPC"
+          Description="Uninstall AppleMusicRPC"
+          Target="[SystemFolder]msiexec.exe"
+          Arguments="/x {D0A0E8B1-B1E7-4B3A-88D9-3A5E0AE5B24F}"
+          WorkingDirectory="SystemFolder"
+          Icon="AppIcon"
+          IconIndex="0" />
+
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Feralthedogg\AppleMusicRPC"
+          Name="installed"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+
+        <RemoveFolder Id="rm_pm_app" Directory="PM_APP" On="uninstall" />
+        <RemoveFolder Id="rm_pm_company" Directory="PM_COMPANY" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <CustomAction
+      Id="CA_LaunchAfterInstall"
+      FileRef="fil_exe"
+      ExeCommand=""
+      Execute="immediate"
+      Return="asyncNoWait"
+      Impersonate="yes" />
+
+    <InstallExecuteSequence>
+      <Custom Action="CA_LaunchAfterInstall"
+              After="InstallFinalize"
+              Condition="NOT Installed AND UILevel &gt;= 3" />
+    </InstallExecuteSequence>
+
+    <Feature Id="MainFeature" Title="AppleMusicRPC" Level="1">
+      <ComponentRef Id="cmp_main" />
+      <ComponentRef Id="cmp_config" />
+      <ComponentRef Id="cmp_shortcuts" />
+    </Feature>
+
+  </Package>
+</Wix>
