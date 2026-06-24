@@ -1,11 +1,9 @@
-//go:build windows
-
-// windows/internal/discordrpc/discordrpc_windows.go
+// windows/internal/discordrpc/discordrpc.go
 //
-// Windows-only Discord Rich Presence over Discord IPC named pipes.
+// Discord Rich Presence over Discord IPC.
 //
 // This implements:
-// - connect & handshake to \\.\pipe\discord-ipc-0..9
+// - connect & handshake to the platform Discord IPC endpoint
 // - framed JSON read/write
 // - SET_ACTIVITY to publish a Listening activity
 //
@@ -23,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -42,7 +41,7 @@ type RPC struct {
 	largeImage string
 	largeText  string
 
-	pipe *os.File
+	pipe io.ReadWriteCloser
 	pid  int
 
 	activityType int
@@ -50,7 +49,17 @@ type RPC struct {
 }
 
 func Login(appID, largeImage, largeText string) (*RPC, error) {
-	r := &RPC{
+	r := New(appID, largeImage, largeText)
+	if err := r.connect(); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// New creates an RPC client without connecting immediately.
+// Calls to SetPlaying, SetPaused, or Clear will attempt to connect lazily.
+func New(appID, largeImage, largeText string) *RPC {
+	return &RPC{
 		appID:        appID,
 		largeImage:   largeImage,
 		largeText:    largeText,
@@ -58,22 +67,17 @@ func Login(appID, largeImage, largeText string) (*RPC, error) {
 		activityType: ActivityTypeListening,
 		activityName: "Apple Music",
 	}
-	if err := r.connect(); err != nil {
-		return nil, err
-	}
-	return r, nil
 }
 
 func (r *RPC) connect() error {
 	var lastErr error
 	for i := 0; i < 10; i++ {
-		p := fmt.Sprintf(`\\.\pipe\discord-ipc-%d`, i)
-		f, err := os.OpenFile(p, os.O_RDWR, 0)
+		conn, _, err := openDiscordIPC(i)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		r.pipe = f
+		r.pipe = conn
 
 		hs := map[string]any{
 			"v":         1,
@@ -87,7 +91,7 @@ func (r *RPC) connect() error {
 		}
 
 		// Best-effort: discard handshake response.
-		_, _, _ = r.read()
+		_, _, _ = r.readWithTimeout(2 * time.Second)
 		return nil
 	}
 	if lastErr == nil {
@@ -252,7 +256,7 @@ func (r *RPC) setActivity(a *activity) error {
 		// If pipe broke, reconnect once and retry.
 		r.Close()
 		if err2 := r.connect(); err2 != nil {
-			return err
+			return err2
 		}
 		if err2 := r.write(opFrame, payload); err2 != nil {
 			return err2
@@ -260,7 +264,7 @@ func (r *RPC) setActivity(a *activity) error {
 	}
 
 	// Best-effort: discard response (Discord replies with a frame).
-	_, _, _ = r.read()
+	_, _, _ = r.readWithTimeout(2 * time.Second)
 	return nil
 }
 
@@ -274,11 +278,10 @@ func (r *RPC) write(op int32, v any) error {
 	binary.LittleEndian.PutUint32(hdr[0:4], uint32(op))
 	binary.LittleEndian.PutUint32(hdr[4:8], uint32(len(b)))
 
-	if _, err := r.pipe.Write(hdr[:]); err != nil {
+	if err := writeFull(r.pipe, hdr[:]); err != nil {
 		return err
 	}
-	_, err = r.pipe.Write(b)
-	return err
+	return writeFull(r.pipe, b)
 }
 
 func (r *RPC) read() (op int32, data []byte, err error) {
@@ -300,10 +303,38 @@ func (r *RPC) read() (op int32, data []byte, err error) {
 	return op, buf, nil
 }
 
-func readFull(f *os.File, b []byte) (int, error) {
+type readDeadliner interface {
+	SetReadDeadline(time.Time) error
+}
+
+func (r *RPC) readWithTimeout(timeout time.Duration) (op int32, data []byte, err error) {
+	if timeout > 0 {
+		if d, ok := r.pipe.(readDeadliner); ok {
+			_ = d.SetReadDeadline(time.Now().Add(timeout))
+			defer d.SetReadDeadline(time.Time{})
+		}
+	}
+	return r.read()
+}
+
+func writeFull(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		b = b[n:]
+	}
+	return nil
+}
+
+func readFull(r io.Reader, b []byte) (int, error) {
 	total := 0
 	for total < len(b) {
-		n, err := f.Read(b[total:])
+		n, err := r.Read(b[total:])
 		if n > 0 {
 			total += n
 		}

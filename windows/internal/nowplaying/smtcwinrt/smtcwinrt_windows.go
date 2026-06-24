@@ -21,7 +21,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"unicode/utf16"
 	"unsafe"
 
 	"amrpc/internal/nowplaying"
@@ -31,6 +30,7 @@ import (
 
 var (
 	combase = windows.NewLazySystemDLL("combase.dll")
+	kernel  = windows.NewLazySystemDLL("kernel32.dll")
 
 	procRoInitialize           = combase.NewProc("RoInitialize")
 	procRoUninitialize         = combase.NewProc("RoUninitialize")
@@ -38,6 +38,7 @@ var (
 	procWindowsCreateString    = combase.NewProc("WindowsCreateString")
 	procWindowsDeleteString    = combase.NewProc("WindowsDeleteString")
 	procWindowsGetStringRawBuf = combase.NewProc("WindowsGetStringRawBuffer")
+	procWideCharToMultiByte    = kernel.NewProc("WideCharToMultiByte")
 )
 
 const (
@@ -45,6 +46,8 @@ const (
 
 	asyncStatusStarted   = 0
 	asyncStatusCompleted = 1
+
+	cpUTF8 = 65001
 )
 
 var (
@@ -62,13 +65,17 @@ func mustGUID(s string) windows.GUID {
 }
 
 type comObj struct {
-	ptr uintptr
+	ptr unsafe.Pointer
 }
 
-func (o *comObj) isNil() bool { return o == nil || o.ptr == 0 }
+func (o *comObj) isNil() bool { return o == nil || o.ptr == nil }
+
+func (o *comObj) raw() uintptr {
+	return uintptr(o.ptr)
+}
 
 func (o *comObj) vtblPtr() *uintptr {
-	return *(**uintptr)(unsafe.Pointer(o.ptr))
+	return *(**uintptr)(o.ptr)
 }
 
 func (o *comObj) method(index int) uintptr {
@@ -80,7 +87,7 @@ func (o *comObj) method(index int) uintptr {
 func (o *comObj) call(index int, args ...uintptr) uintptr {
 	fn := o.method(index)
 	argv := make([]uintptr, 0, 1+len(args))
-	argv = append(argv, o.ptr)
+	argv = append(argv, o.raw())
 	argv = append(argv, args...)
 	r1, _, _ := syscall.SyscallN(fn, argv...)
 	return r1
@@ -91,23 +98,23 @@ func (o *comObj) release() {
 		return
 	}
 	_ = o.call(2) // IUnknown::Release
-	o.ptr = 0
+	o.ptr = nil
 }
 
 func (o *comObj) queryInterface(iid *windows.GUID) (*comObj, uintptr) {
-	var out uintptr
+	var out unsafe.Pointer
 	hr := o.call(0,
 		uintptr(unsafe.Pointer(iid)),
 		uintptr(unsafe.Pointer(&out)),
 	)
-	if hr != 0 || out == 0 {
+	if hr != 0 || out == nil {
 		return nil, hr
 	}
 	return &comObj{ptr: out}, 0
 }
 
 func releaseClose(o *comObj) {
-	if o == nil || o.ptr == 0 {
+	if o == nil || o.ptr == nil {
 		return
 	}
 	if c, hr := o.queryInterface(&iidClosable); hr == 0 && c != nil {
@@ -165,8 +172,43 @@ func hstringToString(hs uintptr) string {
 	if p == 0 || n == 0 {
 		return ""
 	}
-	buf := unsafe.Slice((*uint16)(unsafe.Pointer(p)), n)
-	return string(utf16.Decode(buf))
+	return wideStringToUTF8(p, n)
+}
+
+func wideStringToUTF8(p uintptr, n uint32) string {
+	if p == 0 || n == 0 {
+		return ""
+	}
+
+	need, _, _ := procWideCharToMultiByte.Call(
+		uintptr(cpUTF8),
+		0,
+		p,
+		uintptr(n),
+		0,
+		0,
+		0,
+		0,
+	)
+	if need == 0 {
+		return ""
+	}
+
+	buf := make([]byte, int(need))
+	wrote, _, _ := procWideCharToMultiByte.Call(
+		uintptr(cpUTF8),
+		0,
+		p,
+		uintptr(n),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+		0,
+		0,
+	)
+	if wrote == 0 {
+		return ""
+	}
+	return string(buf[:int(wrote)])
 }
 
 func roGetActivationFactory(className string, iid *windows.GUID) (*comObj, error) {
@@ -176,20 +218,20 @@ func roGetActivationFactory(className string, iid *windows.GUID) (*comObj, error
 	}
 	defer deleteHString(hs)
 
-	var out uintptr
+	var out unsafe.Pointer
 	hr, _, _ := procRoGetActivationFactory.Call(
 		hs,
 		uintptr(unsafe.Pointer(iid)),
 		uintptr(unsafe.Pointer(&out)),
 	)
-	if hr != 0 {
+	if hr != 0 || out == nil {
 		return nil, fmt.Errorf("RoGetActivationFactory hr=0x%08X", uint32(hr))
 	}
 	return &comObj{ptr: out}, nil
 }
 
 func waitAsync(op *comObj, timeout time.Duration) (*comObj, error) {
-	if op == nil || op.ptr == 0 {
+	if op == nil || op.ptr == nil {
 		return nil, errors.New("async op nil")
 	}
 
@@ -222,9 +264,9 @@ func waitAsync(op *comObj, timeout time.Duration) (*comObj, error) {
 		return nil, fmt.Errorf("async status=%d error=0x%08X", st, ec)
 	}
 
-	var res uintptr
+	var res unsafe.Pointer
 	hr3 := op.call(8, uintptr(unsafe.Pointer(&res))) // GetResults
-	if hr3 != 0 || res == 0 {
+	if hr3 != 0 || res == nil {
 		return nil, fmt.Errorf("GetResults hr=0x%08X", uint32(hr3))
 	}
 
@@ -252,10 +294,10 @@ func New(prefer []string) (*Provider, bool) {
 		return nil, false
 	}
 
-	var async uintptr
+	var async unsafe.Pointer
 	hr := statics.call(6, uintptr(unsafe.Pointer(&async))) // RequestAsync
 	statics.release()
-	if hr != 0 || async == 0 {
+	if hr != 0 || async == nil {
 		roUninitialize()
 		return nil, false
 	}
@@ -317,15 +359,15 @@ func (p *Provider) getSourceAppId(session *comObj) string {
 }
 
 func (p *Provider) pickSession() (*comObj, string) {
-	if p == nil || p.manager == nil || p.manager.ptr == 0 {
+	if p == nil || p.manager == nil || p.manager.ptr == nil {
 		return nil, ""
 	}
 
 	// Try the current session first.
 	{
-		var sess uintptr
+		var sess unsafe.Pointer
 		hr := p.manager.call(6, uintptr(unsafe.Pointer(&sess))) // GetCurrentSession
-		if hr == 0 && sess != 0 {
+		if hr == 0 && sess != nil {
 			s := &comObj{ptr: sess}
 			appid := p.getSourceAppId(s)
 			if p.preferMatch(appid) {
@@ -336,9 +378,9 @@ func (p *Provider) pickSession() (*comObj, string) {
 	}
 
 	// Otherwise enumerate all sessions.
-	var list uintptr
+	var list unsafe.Pointer
 	hr := p.manager.call(7, uintptr(unsafe.Pointer(&list))) // GetSessions
-	if hr != 0 || list == 0 {
+	if hr != 0 || list == nil {
 		return nil, ""
 	}
 	lv := &comObj{ptr: list}
@@ -348,9 +390,9 @@ func (p *Provider) pickSession() (*comObj, string) {
 	_ = lv.call(7, uintptr(unsafe.Pointer(&count))) // get_Size
 
 	for i := int32(0); i < count; i++ {
-		var sess uintptr
+		var sess unsafe.Pointer
 		_ = lv.call(6, uintptr(i), uintptr(unsafe.Pointer(&sess))) // GetAt
-		if sess == 0 {
+		if sess == nil {
 			continue
 		}
 		s := &comObj{ptr: sess}
@@ -370,14 +412,14 @@ func ticksToDuration(ticks int64) time.Duration {
 
 func (p *Provider) Poll() (nowplaying.Track, bool, error) {
 	sess, appid := p.pickSession()
-	if sess == nil || sess.ptr == 0 {
+	if sess == nil || sess.ptr == nil {
 		return nowplaying.Track{}, false, nil
 	}
 	defer sess.release()
 
-	var mediaAsync uintptr
+	var mediaAsync unsafe.Pointer
 	hr := sess.call(7, uintptr(unsafe.Pointer(&mediaAsync))) // TryGetMediaPropertiesAsync
-	if hr != 0 || mediaAsync == 0 {
+	if hr != 0 || mediaAsync == nil {
 		return nowplaying.Track{}, false, nil
 	}
 
@@ -429,8 +471,8 @@ func (p *Provider) Poll() (nowplaying.Track, bool, error) {
 
 	st := nowplaying.Stopped
 	{
-		var pb uintptr
-		if sess.call(9, uintptr(unsafe.Pointer(&pb))) == 0 && pb != 0 { // get_PlaybackInfo
+		var pb unsafe.Pointer
+		if sess.call(9, uintptr(unsafe.Pointer(&pb))) == 0 && pb != nil { // get_PlaybackInfo
 			pi := &comObj{ptr: pb}
 			defer pi.release()
 
@@ -449,8 +491,8 @@ func (p *Provider) Poll() (nowplaying.Track, bool, error) {
 
 	var pos, dur time.Duration
 	{
-		var tl uintptr
-		if sess.call(8, uintptr(unsafe.Pointer(&tl))) == 0 && tl != 0 { // get_TimelineProperties
+		var tl unsafe.Pointer
+		if sess.call(8, uintptr(unsafe.Pointer(&tl))) == 0 && tl != nil { // get_TimelineProperties
 			tlo := &comObj{ptr: tl}
 			defer tlo.release()
 

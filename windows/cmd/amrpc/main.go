@@ -1,56 +1,33 @@
-//go:build windows
-
 // windows/cmd/amrpc/main.go
 //
-// AppleMusicRPC (Windows)
+// # AppleMusicRPC
 //
 // - Runs as a tray/background app
-// - Reads now-playing info via SMTC (WinRT)
+// - Reads now-playing info via the platform default provider
 // - Publishes Discord Rich Presence via Discord IPC
 //
 // UI goal:
 // - Details (big line): Title only
 // - State   (small line): Artist • Album
-//
-// Session selection goal:
-// - Default to Apple Music only (avoid switching to YouTube/Chrome when Apple Music stops)
-//
-// Config loading:
-// - Prefer ProgramData (MSI install):   C:\ProgramData\Feralthedogg\AppleMusicRPC\config.json
-// - Fallback to beside executable:      <exe_dir>\config.json
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"amrpc/internal/artwork"
+	"amrpc/internal/backend"
 	"amrpc/internal/config"
 	drpc "amrpc/internal/discordrpc"
 	"amrpc/internal/nowplaying"
-	"amrpc/internal/nowplaying/smtcwinrt"
+	"amrpc/internal/platform"
 	"amrpc/internal/singleinst"
 	"amrpc/internal/ui"
 
 	"github.com/getlantern/systray"
-	"golang.org/x/sys/windows"
 )
-
-var (
-	kernel32        = windows.NewLazySystemDLL("kernel32.dll")
-	procFreeConsole = kernel32.NewProc("FreeConsole")
-)
-
-// detachConsole detaches this process from the current console (if any).
-// This makes the app behave like a background/tray app even when launched from a terminal.
-func detachConsole() {
-	_, _, _ = procFreeConsole.Call()
-}
 
 // normalizeText collapses all whitespace (including newlines) into single spaces.
 // This prevents false "trackChanged" when providers emit "Bon \nJovi" or similar.
@@ -114,42 +91,9 @@ func clampDur(v, lo, hi time.Duration) time.Duration {
 	return v
 }
 
-// loadConfig tries ProgramData first (for MSI installs), then falls back to config.json near the exe.
-func loadConfig() (config.Config, error) {
-	// Defaults (keep in sync with config.LoadNearExe defaults).
-	cfg := config.Config{
-		PollMS:         1200,
-		LargeText:      "Apple Music",
-		UseAlbumArt:    true,
-		ShowPaused:     true,
-		ForceRefreshMS: 0,
-	}
-
-	// 1) ProgramData\Feralthedogg\AppleMusicRPC\config.json
-	if pd := os.Getenv("ProgramData"); pd != "" {
-		p := filepath.Join(pd, "Feralthedogg", "AppleMusicRPC", "config.json")
-		if b, err := os.ReadFile(p); err == nil {
-			if err := json.Unmarshal(b, &cfg); err != nil {
-				return cfg, fmt.Errorf("parse %s: %w", p, err)
-			}
-			// sanitize
-			if cfg.PollMS <= 0 {
-				cfg.PollMS = 1200
-			}
-			if cfg.LargeText == "" {
-				cfg.LargeText = "Apple Music"
-			}
-			return cfg, nil
-		}
-	}
-
-	// 2) Fallback: config.json near exe (portable mode)
-	return config.LoadNearExe()
-}
-
 func main() {
 	// Detach from console so we don't keep a visible terminal session.
-	detachConsole()
+	platform.DetachConsole()
 
 	// --- Single instance lock (critical) ---
 	// Keep the returned handle alive for the entire process lifetime.
@@ -168,7 +112,7 @@ func main() {
 	// --------------------------------------
 
 	// Load configuration (config.json).
-	cfg, err := loadConfig()
+	cfg, err := config.LoadAppConfig()
 	if err != nil {
 		ui.Error("Apple Music RPC", "Failed to load configuration file (config.json):\n"+err.Error())
 		return
@@ -197,17 +141,14 @@ func main() {
 		country = cc
 	}
 
-	// Connect to Discord IPC.
-	rpc, err := drpc.Login(cfg.DiscordAppID, cfg.LargeImage, cfg.LargeText)
-	if err != nil {
-		ui.Error("Apple Music RPC", "Discord login failed:\n"+err.Error())
-		return
-	}
+	// Discord IPC is connected lazily so the app can keep running even if
+	// Discord starts after AppleMusicRPC.
+	rpc := drpc.New(cfg.DiscordAppID, cfg.LargeImage, cfg.LargeText)
 
-	// Initialize SMTC provider (WinRT).
-	prov, ok := smtcwinrt.New(prefer)
+	// Initialize the platform now-playing provider.
+	prov, ok := backend.New(prefer)
 	if !ok {
-		ui.Error("Apple Music RPC", "SMTC WinRT provider init failed.")
+		ui.Error("Apple Music RPC", "Now-playing provider init failed.")
 		return
 	}
 
@@ -377,18 +318,25 @@ func main() {
 				tClean.Artist = cleanArtist(tClean.Artist)
 				tClean.Album = cleanAlbum(tClean.Album)
 
+				// Apply user policy: if ShowPaused=false, treat Paused as Stopped.
+				effectiveStatus := tClean.Status
+				if !cfg.ShowPaused && tClean.Status == nowplaying.Paused {
+					effectiveStatus = nowplaying.Stopped
+				}
+
+				// Some providers can report stopped without metadata. Clear immediately
+				// instead of treating the empty metadata as a transient no-session state.
+				if effectiveStatus == nowplaying.Stopped {
+					clearAll()
+					continue
+				}
+
 				// If metadata is empty, treat as unusable session (debounce via noSessionSince).
 				if tClean.Title == "" && tClean.Artist == "" {
 					if noSessionSince.IsZero() {
 						noSessionSince = now
 					}
 					continue
-				}
-
-				// Apply user policy: if ShowPaused=false, treat Paused as Stopped.
-				effectiveStatus := tClean.Status
-				if !cfg.ShowPaused && tClean.Status == nowplaying.Paused {
-					effectiveStatus = nowplaying.Stopped
 				}
 
 				trackChanged := !sameTrack(last, tClean)
@@ -486,19 +434,6 @@ func main() {
 					lastGoodPos = rawPos
 					lastGoodAt = now
 					seekStreak = 0
-				}
-
-				// If stopped, clear immediately.
-				if effectiveStatus == nowplaying.Stopped {
-					rpc.Clear()
-					lastSentDur = 0
-					haveAnchor = false
-					anchorStartUnix = 0
-					pendingAnchorFix = false
-					seekStreak = 0
-					last = tClean
-					lastStatus = effectiveStatus
-					continue
 				}
 
 				// Compute stable anchored position.
@@ -632,6 +567,7 @@ func main() {
 
 	// Tray UI. This keeps the program alive and provides a Quit button.
 	systray.Run(func() {
+		systray.SetTitle("AMRPC")
 		systray.SetTooltip("Apple Music → Discord Rich Presence")
 
 		// Shows the backend type (useful if multiple providers exist).
