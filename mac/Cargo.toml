@@ -1,0 +1,29 @@
+[package]
+name = "apple-music-rpc"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "BSD-3-Clause"
+description = "Native macOS Apple Music to Discord Rich Presence"
+
+[[bin]]
+name = "AppleMusicRPC"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+ctrlc = { version = "3.5", features = ["termination"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+libc = "0.2"
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "query", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-normalization = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

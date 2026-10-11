@@ -2,7 +2,7 @@
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](./LICENSE)
 
 AppleMusicRPC is an Apple Music → Discord Rich Presence app.  
-On Windows, it reads the track currently playing in Apple Music via SMTC. On macOS, it reads Music.app via AppleScript. The current track is shown in your Discord status as a Listening activity.
+On Windows, the Go app reads Apple Music via SMTC. On macOS, the native Rust app reads Music.app through the macOS scripting API. The current track is shown in Discord as a Listening activity.
 
 ## Features
 
@@ -11,16 +11,22 @@ On Windows, it reads the track currently playing in Apple Music via SMTC. On mac
 - **Auto-start support (installer option)**: Can register itself to start automatically when you sign in to Windows.
 - **Clean install/uninstall**: Aims to provide MSI-based installation/removal, cleaning up startup entries and shortcuts on uninstall.
 - **macOS app bundle**: Builds a menu bar `.app` that reads Music.app and talks to Discord through the local IPC socket.
+- **Verified macOS album covers**: Reads Music's original artwork and compares it with Apple catalog images. Also checks the exact artist, title, album, disc/track number, and duration. Unverified matches are rejected.
+- **Resilient macOS playback**: Background artwork lookup, track-bound caching, stable progress timestamps, pause/seek handling, and automatic Discord reconnection.
 
 ## Installation
 
 ### Windows
 
-- Install using the provided **MSI installer**.
+- Install using the [Windows v1.0.1 MSI installer](https://github.com/Feralthedogg/AppleMusicRPC/releases/download/v1.0.1/AppleMusicRPC-1.0.1-x64.msi).
 - After installation, you can launch it from the Start Menu or from the installation folder.
 - If auto-start is enabled, it will launch automatically after reboot/sign-in.
 
 ### macOS
+
+Requires macOS 12 or later. Building requires Rust 1.88 or later and Xcode Command Line Tools. The built app does not require Go, Rust, or a separate runtime.
+
+Download the [macOS v2.0.0 app for Apple Silicon](https://github.com/Feralthedogg/AppleMusicRPC/releases/download/v2.0.0/AppleMusicRPC-2.0.0-macos-arm64.zip), unzip it, and move `AppleMusicRPC.app` to Applications. This release uses ad hoc signing and is not notarized by Apple. Intel Macs can build the app from source.
 
 Build the app bundle:
 
@@ -48,6 +54,22 @@ To remove the background auto-start service:
 ./scripts/uninstall-macos-launchagent.sh
 ```
 
+To update a running app while preserving its configuration and login service:
+
+```sh
+./scripts/update-macos.sh
+```
+
+The updater finishes compiling and signing before stopping the old process. It saves the previous app under `~/Library/Application Support/Feralthedogg/AppleMusicRPC/backups`, installs the new bundle, and starts it. Menu-bar **Quit** clears Discord presence and stays quit; the login service restarts the app after a crash or at the next login.
+
+The macOS source is in `mac/src`; Windows continues to use `windows/`.
+
+Create a release ZIP and SHA-256 checksum for the build machine's architecture:
+
+```sh
+./scripts/package-macos-release.sh
+```
+
 ## Configuration
 
 - The app uses a `config.json` configuration file.
@@ -59,6 +81,10 @@ To remove the background auto-start service:
   - Or the app install folder / development `dist/config.json` path (varies by build)
 
 > Changes to the config are applied after restarting the app.
+
+macOS retains the existing JSON fields. `large_text` is ignored on macOS so Discord displays the album only once, in the artist/album line. `country` selects the Apple storefront; an empty value uses the macOS locale. `fallback_countries` defaults to `["KR", "US", "JP", "GB"]` for releases unavailable in the first storefront. No IP geolocation service is required. Set `AMRPC_CONFIG` or pass `--config PATH` to select a configuration explicitly.
+
+When Music has no readable original artwork, the resolver requires exact album metadata. If a local/custom cover or unavailable release has no verified public Apple image, it uses `large_image` (or omits the image when that is empty). Local artwork stays on the Mac; it is not uploaded. The menu's **Retry album cover** bypasses the artwork cache.
 
 ## Usage
 
@@ -78,10 +104,28 @@ To remove the background auto-start service:
 - **Config file won’t save**
   - Writing to `ProgramData` may require proper permissions (ACL). The installer build is intended to configure this correctly.
 
+macOS diagnostics:
+
+```sh
+# Read the current track and verify artwork without publishing to Discord.
+mac/dist/AppleMusicRPC.app/Contents/MacOS/AppleMusicRPC --diagnose
+
+# Check Discord's IPC handshake without changing presence.
+mac/dist/AppleMusicRPC.app/Contents/MacOS/AppleMusicRPC --probe-discord
+
+# Show the running app's track, verified artwork, and Discord acknowledgement.
+mac/dist/AppleMusicRPC.app/Contents/MacOS/AppleMusicRPC --status
+
+cargo test --manifest-path mac/Cargo.toml --locked
+cargo clippy --manifest-path mac/Cargo.toml --locked --all-targets -- -D warnings
+```
+
+Logs are in `~/Library/Logs/AppleMusicRPC/launchd.err.log`, status in `~/Library/Application Support/Feralthedogg/AppleMusicRPC/status.json`, and the bounded artwork cache in `~/Library/Caches/Feralthedogg/AppleMusicRPC/artwork-v2.json`. Music Automation permission is required; if macOS prompts after an update, allow access to Music.
+
 ## Platform Status
 
 - Windows: supported through SMTC and named-pipe Discord IPC.
-- macOS: supported through Music.app AppleScript and Unix-socket Discord IPC.
+- macOS: native Rust menu-bar app, Music.app scripting and original-artwork verification, Unix-socket Discord IPC.
 - Android and other platforms: not implemented.
 
 ## License

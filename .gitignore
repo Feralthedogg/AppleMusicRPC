@@ -1,0 +1,6 @@
+/mac/target/
+/mac/release/
+/mac/dist/*.staging/
+/mac/dist/*.previous/
+/mac/dist/.amrpc-build.*/
+.DS_Store
