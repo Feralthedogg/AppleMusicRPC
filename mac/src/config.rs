@@ -46,7 +46,7 @@ pub fn support_dir() -> Result<PathBuf> {
 }
 
 pub fn cache_path() -> Result<PathBuf> {
-    Ok(home()?.join("Library/Caches/Feralthedogg/AppleMusicRPC/artwork-v2.json"))
+    Ok(home()?.join("Library/Caches/Feralthedogg/AppleMusicRPC/artwork-v3.json"))
 }
 
 pub fn status_path() -> Result<PathBuf> {

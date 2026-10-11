@@ -277,6 +277,9 @@ pub fn run(
             pending = false;
             match result.result {
                 Ok(Some(meta)) => {
+                    if meta.image_source == "mediaremote-artwork-callback" {
+                        status.native_artwork = true;
+                    }
                     eprintln!(
                         "Cover verified: {} / {} / track {} ({}; difference {:?})",
                         meta.album,

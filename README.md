@@ -11,7 +11,7 @@ On Windows, the Go app reads Apple Music via SMTC. On macOS, the native Rust app
 - **Auto-start support (installer option)**: Can register itself to start automatically when you sign in to Windows.
 - **Clean install/uninstall**: Aims to provide MSI-based installation/removal, cleaning up startup entries and shortcuts on uninstall.
 - **macOS app bundle**: Builds a menu bar `.app` that reads Music.app and talks to Discord through the local IPC socket.
-- **Verified macOS album covers**: Reads Music's original artwork and compares it with Apple catalog images. Also checks the exact artist, title, album, disc/track number, and duration. Unverified matches are rejected.
+- **Native macOS album covers**: Receives the current photo from Music's native artwork callback, finds the same image in Music's URL cache, and verifies the public image against that photo. Cover selection uses the picture itself rather than catalog IDs.
 - **Resilient macOS playback**: Background artwork lookup, track-bound caching, stable progress timestamps, pause/seek handling, and automatic Discord reconnection.
 
 ## Installation
@@ -26,7 +26,7 @@ On Windows, the Go app reads Apple Music via SMTC. On macOS, the native Rust app
 
 Requires macOS 12 or later. Building requires Rust 1.88 or later and Xcode Command Line Tools. The built app does not require Go, Rust, or a separate runtime.
 
-Download the [macOS v2.0.0 app for Apple Silicon](https://github.com/Feralthedogg/AppleMusicRPC/releases/download/v2.0.0/AppleMusicRPC-2.0.0-macos-arm64.zip), unzip it, and move `AppleMusicRPC.app` to Applications. This release uses ad hoc signing and is not notarized by Apple. Intel Macs can build the app from source.
+Download the [macOS v2.0.1 app for Apple Silicon](https://github.com/Feralthedogg/AppleMusicRPC/releases/download/v2.0.1/AppleMusicRPC-2.0.1-macos-arm64.zip), unzip it, and move `AppleMusicRPC.app` to Applications. This release uses ad hoc signing and is not notarized by Apple. Intel Macs can build the app from source.
 
 Build the app bundle:
 
@@ -84,7 +84,9 @@ Create a release ZIP and SHA-256 checksum for the build machine's architecture:
 
 macOS retains the existing JSON fields. `large_text` is ignored on macOS so Discord displays the album only once, in the artist/album line. `country` selects the Apple storefront; an empty value uses the macOS locale. `fallback_countries` defaults to `["KR", "US", "JP", "GB"]` for releases unavailable in the first storefront. No IP geolocation service is required. Set `AMRPC_CONFIG` or pass `--config PATH` to select a configuration explicitly.
 
-When Music has no readable original artwork, the resolver requires exact album metadata. If a local/custom cover or unavailable release has no verified public Apple image, it uses `large_image` (or omits the image when that is empty). Local artwork stays on the Mac; it is not uploaded. The menu's **Retry album cover** bypasses the artwork cache.
+The cover reader calls `MRNowPlayingRequest.requestNowPlayingItemArtworkWithCompletion:` and receives `MRArtwork.imageData` through the system's Apple-signed `osascript` host. Photos stay on the Mac. Music's image URL caches are opened read-only; matching HEIC images are decoded with Apple's image codec, and only verified public Apple image URLs are sent to Discord. This private native API may change with macOS updates; the Music scripting artwork getter remains a fallback.
+
+When the exact photo is absent from Music's URL cache, the resolver compares Apple search images against the actual photo. When neither native reader can supply a photo, it requires exact album metadata. Local/custom covers with no matching public Apple URL use `large_image` (or omit the image when it is empty). The menu's **Retry album cover** bypasses the resolved-cover cache. The Apple Music button is included only when a matching track link is known.
 
 ## Usage
 
@@ -120,7 +122,7 @@ cargo test --manifest-path mac/Cargo.toml --locked
 cargo clippy --manifest-path mac/Cargo.toml --locked --all-targets -- -D warnings
 ```
 
-Logs are in `~/Library/Logs/AppleMusicRPC/launchd.err.log`, status in `~/Library/Application Support/Feralthedogg/AppleMusicRPC/status.json`, and the bounded artwork cache in `~/Library/Caches/Feralthedogg/AppleMusicRPC/artwork-v2.json`. Music Automation permission is required; if macOS prompts after an update, allow access to Music.
+Logs are in `~/Library/Logs/AppleMusicRPC/launchd.err.log`, status in `~/Library/Application Support/Feralthedogg/AppleMusicRPC/status.json`, resolved covers in `~/Library/Caches/Feralthedogg/AppleMusicRPC/artwork-v3.json`, and the local Music image index in the same cache folder. The status includes `image_source` and `verification` for checking whether a cover came from the native callback and Music cache. Music Automation permission is required; if macOS prompts after an update, allow access to Music.
 
 ## Platform Status
 

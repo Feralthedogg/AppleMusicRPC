@@ -85,7 +85,9 @@ pub fn activity(config: &Config, track: &Track, meta: Option<&Meta>, timeline: &
         // activities. The album is already present in state, so omit that line.
         activity["assets"] = json!({"large_image": image});
     }
-    if let Some(meta) = meta {
+    if let Some(meta) = meta
+        && !meta.track_url.is_empty()
+    {
         activity["buttons"] = json!([{"label": "Play On Apple Music", "url": meta.track_url}]);
     }
     activity

@@ -1,9 +1,14 @@
 use crate::{
     config::{Config, atomic_json},
+    media_remote,
     model::{Track, TrackKey, normalized},
+    music_artwork_cache::MusicCache,
 };
 use anyhow::{Context, Result, bail};
 use image::{ImageReader, imageops::FilterType};
+use objc2::{rc::autoreleasepool, runtime::AnyObject};
+use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey};
+use objc2_foundation::{NSData, NSDictionary};
 use reqwest::{Url, blocking::Client};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -29,6 +34,7 @@ pub struct Meta {
     pub country: String,
     pub verification: String,
     pub image_difference: Option<f64>,
+    pub image_source: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -42,7 +48,28 @@ impl Fingerprint {
         limits.max_image_height = Some(8192);
         limits.max_alloc = Some(128 * 1024 * 1024);
         reader.limits(limits);
-        let image = reader.decode().context("decoding album cover")?;
+        let image = match reader.decode() {
+            Ok(image) => image,
+            Err(error) => autoreleasepool(|_| {
+                // Music's NSURLCache commonly stores HEIC. Decode with Apple's
+                // image codec, then feed a portable JPEG to the same colour grid.
+                let bitmap = NSBitmapImageRep::imageRepWithData(&NSData::with_bytes(data))
+                    .with_context(|| format!("decoding album cover: {error}"))?;
+                if bitmap.pixelsWide() > 8192 || bitmap.pixelsHigh() > 8192 {
+                    bail!("album cover dimensions exceed 8192 px");
+                }
+                let properties = NSDictionary::<NSBitmapImageRepPropertyKey, AnyObject>::new();
+                // SAFETY: the empty dictionary has the exact property-key/object types.
+                let jpeg = unsafe {
+                    bitmap.representationUsingType_properties(
+                        NSBitmapImageFileType::JPEG,
+                        &properties,
+                    )
+                }
+                .context("converting native album image")?;
+                image::load_from_memory(&jpeg.to_vec()).context("decoding native album image")
+            })?,
+        };
         // A small colour grid tolerates JPEG compression and thumbnail resizing,
         // while distinguishing covers whose layout is similar but colours differ.
         Ok(Self(
@@ -64,8 +91,8 @@ impl Fingerprint {
             .sqrt()
     }
 
-    pub fn matches(&self, other: &Self) -> bool {
-        self.difference(other) <= 12.0
+    pub fn exact_photo_match(&self, other: &Self) -> bool {
+        self.0.len() == 768 && other.0.len() == 768 && self.difference(other) <= 6.0
     }
 }
 
@@ -129,6 +156,7 @@ pub struct Resolver {
     cache_path: PathBuf,
     cache: Cache,
     last_request: Option<Instant>,
+    music_cache: MusicCache,
 }
 
 fn unix_time() -> u64 {
@@ -197,32 +225,6 @@ fn metadata_score(track: &Track, candidate: &Candidate, have_reference: bool) ->
     Some(difference)
 }
 
-fn catalog_id(address: &str) -> Option<u64> {
-    let url = Url::parse(address).ok()?;
-    if !matches!(url.host_str(), Some("music.apple.com" | "itunes.apple.com")) {
-        return None;
-    }
-    for (key, value) in url.query_pairs() {
-        if matches!(key.as_ref(), "i" | "id")
-            && let Ok(id) = value.parse::<u64>()
-            && id > 0
-        {
-            return Some(id);
-        }
-    }
-    // /song/name/id is a song ID; /album/name/id alone is an album ID.
-    if url.path().contains("/song/") {
-        return url
-            .path_segments()?
-            .next_back()?
-            .trim_start_matches("id")
-            .parse::<u64>()
-            .ok()
-            .filter(|id| *id > 0);
-    }
-    None
-}
-
 fn artwork_url(value: &str) -> Result<String> {
     let value = value.replacen("http://", "https://", 1);
     let url = Url::parse(&value)?;
@@ -244,9 +246,9 @@ impl Resolver {
         let cache = fs::read(&cache_path)
             .ok()
             .and_then(|b| serde_json::from_slice::<Cache>(&b).ok())
-            .filter(|c| c.version == 2)
+            .filter(|c| c.version == 3)
             .unwrap_or(Cache {
-                version: 2,
+                version: 3,
                 entries: Vec::new(),
             });
         Ok(Self {
@@ -260,6 +262,7 @@ impl Resolver {
             cache_path,
             cache,
             last_request: None,
+            music_cache: MusicCache::new()?,
         })
     }
 
@@ -322,7 +325,16 @@ impl Resolver {
     ) -> Result<Option<Meta>> {
         let mut candidates: Vec<_> = candidates
             .into_iter()
-            .filter_map(|c| metadata_score(track, &c, reference.is_some()).map(|score| (score, c)))
+            .filter_map(|c| {
+                let score = metadata_score(track, &c, reference.is_some());
+                // The actual current photo is the authority. Edited titles and
+                // regional album names cannot veto a pixel-verified cover.
+                if reference.is_some() && !c.artwork_url100.is_empty() {
+                    Some((score.unwrap_or(10_000.0), c))
+                } else {
+                    score.map(|score| (score, c))
+                }
+            })
             .collect();
         candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (_, candidate) in candidates.into_iter().take(8) {
@@ -344,7 +356,7 @@ impl Resolver {
                     images.insert(cover.clone(), fingerprint);
                 }
                 let image = &images[&cover];
-                if !reference.matches(image) {
+                if !reference.exact_photo_match(image) {
                     eprintln!(
                         "Rejected different artwork: {} / {} (difference {:.1})",
                         candidate.artist_name,
@@ -366,7 +378,7 @@ impl Resolver {
             let upgraded = high_resolution(&cover);
             let cover_url = if upgraded != cover {
                 match self.image(&upgraded, cancel) {
-                    Ok(image) if reference.is_none_or(|r| r.matches(&image)) => upgraded,
+                    Ok(image) if reference.is_none_or(|r| r.exact_photo_match(&image)) => upgraded,
                     _ => {
                         cancel.check()?;
                         cover
@@ -375,18 +387,22 @@ impl Resolver {
             } else {
                 cover
             };
-            let track_url = Url::parse(&candidate.track_view_url)
-                .ok()
-                .filter(|u| u.scheme() == "https" && u.host_str() == Some("music.apple.com"))
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| {
-                    format!(
-                        "https://music.apple.com/{}/album/{}?i={}",
-                        country.to_lowercase(),
-                        candidate.collection_id,
-                        candidate.track_id
-                    )
-                });
+            let track_url = if metadata_score(track, &candidate, reference.is_some()).is_some() {
+                Url::parse(&candidate.track_view_url)
+                    .ok()
+                    .filter(|u| u.scheme() == "https" && u.host_str() == Some("music.apple.com"))
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "https://music.apple.com/{}/album/{}?i={}",
+                            country.to_lowercase(),
+                            candidate.collection_id,
+                            candidate.track_id
+                        )
+                    })
+            } else {
+                String::new()
+            };
             return Ok(Some(Meta {
                 cover_url,
                 track_url,
@@ -401,6 +417,7 @@ impl Resolver {
                 }
                 .into(),
                 image_difference: difference,
+                image_source: "music-current-artwork-getter".into(),
             }));
         }
         Ok(None)
@@ -414,6 +431,30 @@ impl Resolver {
         bypass_cache: bool,
     ) -> Result<Option<Meta>> {
         cancel.check()?;
+        let callback_photo = match media_remote::read_artwork(track, cancel) {
+            Ok(Some(bytes)) => match Fingerprint::from_bytes(&bytes) {
+                Ok(photo) => {
+                    eprintln!("Native artwork callback: {} bytes", bytes.len());
+                    Some(photo)
+                }
+                Err(error) => {
+                    eprintln!("Native artwork image: {error}");
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(error) => {
+                cancel.check()?;
+                eprintln!("Native artwork callback: {error}");
+                None
+            }
+        };
+        let image_source = if callback_photo.is_some() {
+            "mediaremote-artwork-callback"
+        } else {
+            "music-current-artwork-getter"
+        };
+        let reference = callback_photo.as_ref().or(reference);
         let key = track.key();
         if !bypass_cache
             && let Some(entry) = self.cache.entries.iter().find(|entry| {
@@ -427,38 +468,43 @@ impl Resolver {
         }
         let mut images = HashMap::new();
         let mut result = None;
-        for country in self.countries.clone() {
-            cancel.check()?;
-            let mut candidates = Vec::new();
-            if let Some(id) = catalog_id(&track.address) {
-                match self.api(
-                    "lookup",
-                    &[
-                        ("id", &id.to_string()),
-                        ("country", &country),
-                        ("entity", "song"),
-                    ],
-                    cancel,
-                ) {
-                    Ok(found) => candidates.extend(found),
-                    Err(error) => {
-                        cancel.check()?;
-                        eprintln!("Catalog ID lookup ({country}): {error}");
-                    }
+        // Resolve the exact photo's original Music URL without catalog IDs or
+        // track-name matching. The remote rendering must match the photo too.
+        if let Some(reference) = reference
+            && let Some(url) = self.music_cache.find(reference, cancel)?
+        {
+            match self.image(&url, cancel) {
+                Ok(image) if reference.exact_photo_match(&image) => {
+                    result = Some(Meta {
+                        cover_url: url,
+                        track_url: String::new(),
+                        album: track.album.clone(),
+                        track_id: 0,
+                        collection_id: 0,
+                        country: self.countries[0].clone(),
+                        verification: "native-photo-and-music-cache".into(),
+                        image_difference: Some(reference.difference(&image)),
+                        image_source: image_source.into(),
+                    });
                 }
-                result = self.choose(
-                    track,
-                    candidates.clone(),
-                    reference,
-                    &country,
-                    &mut images,
-                    cancel,
-                )?;
-                if result.is_some() {
-                    break;
+                Ok(_) => {}
+                Err(error) => {
+                    cancel.check()?;
+                    eprintln!("Music photo URL: {error}");
                 }
             }
-            let query = format!("{} {} {}", track.artist, track.title, track.album);
+        }
+        for country in self.countries.clone() {
+            if result.is_some() {
+                break;
+            }
+            cancel.check()?;
+            let mut candidates = Vec::new();
+            let query = if reference.is_some() {
+                format!("{} {}", track.album_artist(), track.album)
+            } else {
+                format!("{} {} {}", track.artist, track.title, track.album)
+            };
             match self.api(
                 "search",
                 &[
@@ -481,11 +527,11 @@ impl Resolver {
                 break;
             }
 
-            // Song search often omits an album's less popular tracks. Search the
-            // exact album, then inspect its track list by collection ID instead.
-            if !track.album.is_empty() {
+            // When the image is known, album artwork is sufficient; do not
+            // query catalog IDs or infer an alternate recording from its title.
+            if reference.is_some() && !track.album.is_empty() {
                 let query = format!("{} {}", track.album_artist(), track.album);
-                let albums = match self.api(
+                match self.api(
                     "search",
                     &[
                         ("term", &query),
@@ -496,55 +542,22 @@ impl Resolver {
                     ],
                     cancel,
                 ) {
-                    Ok(found) => found,
+                    Ok(albums) => {
+                        result =
+                            self.choose(track, albums, reference, &country, &mut images, cancel)?;
+                        if result.is_some() {
+                            break;
+                        }
+                    }
                     Err(error) => {
                         cancel.check()?;
-                        eprintln!("Album search ({country}): {error}");
-                        continue;
-                    }
-                };
-                let mut ids = Vec::new();
-                for album in albums {
-                    if album.collection_id > 0
-                        && album_key(&album.collection_name) == album_key(&track.album)
-                        && normalized(&album.artist_name) == normalized(track.album_artist())
-                        && !ids.contains(&album.collection_id)
-                    {
-                        ids.push(album.collection_id);
-                    }
-                }
-                if !ids.is_empty() {
-                    let ids = ids
-                        .into_iter()
-                        .take(8)
-                        .map(|id| id.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let songs = match self.api(
-                        "lookup",
-                        &[
-                            ("id", &ids),
-                            ("country", &country),
-                            ("entity", "song"),
-                            ("limit", "200"),
-                        ],
-                        cancel,
-                    ) {
-                        Ok(found) => found,
-                        Err(error) => {
-                            cancel.check()?;
-                            eprintln!("Album tracks ({country}): {error}");
-                            continue;
-                        }
-                    };
-                    result = self.choose(track, songs, reference, &country, &mut images, cancel)?;
-                    if result.is_some() {
-                        break;
+                        eprintln!("Album photo search ({country}): {error}");
                     }
                 }
             }
         }
-        if let Some(meta) = &result {
+        if let Some(meta) = &mut result {
+            meta.image_source = image_source.into();
             self.cache.entries.retain(|entry| entry.key != key);
             self.cache.entries.push(CacheEntry {
                 key,
@@ -642,23 +655,7 @@ mod tests {
         image::DynamicImage::ImageRgb8(thumb)
             .write_to(&mut jpg, image::ImageFormat::Jpeg)
             .unwrap();
-        assert!(reference.matches(&Fingerprint::from_bytes(jpg.get_ref()).unwrap()));
-        assert!(!reference.matches(&Fingerprint(vec![220; 16 * 16 * 3])));
-    }
-    #[test]
-    fn never_uses_an_album_id_as_a_song_id() {
-        assert_eq!(
-            catalog_id("https://music.apple.com/kr/album/example/123?i=456"),
-            Some(456)
-        );
-        assert_eq!(
-            catalog_id("https://music.apple.com/kr/song/example/456"),
-            Some(456)
-        );
-        assert_eq!(
-            catalog_id("https://music.apple.com/kr/album/example/123"),
-            None
-        );
-        assert_eq!(catalog_id("https://example.com/kr/song/example/456"), None);
+        assert!(reference.exact_photo_match(&Fingerprint::from_bytes(jpg.get_ref()).unwrap()));
+        assert!(!reference.exact_photo_match(&Fingerprint(vec![220; 16 * 16 * 3])));
     }
 }
