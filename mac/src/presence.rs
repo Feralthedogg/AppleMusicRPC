@@ -68,9 +68,9 @@ pub fn activity(config: &Config, track: &Track, meta: Option<&Meta>, timeline: &
     };
     let state = if track.status == Playback::Paused {
         if metadata.is_empty() {
-            "⏸ 일시정지".into()
+            "⏸ Paused".into()
         } else {
-            format!("⏸ 일시정지 • {metadata}")
+            format!("⏸ Paused • {metadata}")
         }
     } else {
         metadata
@@ -137,7 +137,7 @@ mod tests {
         let paused = activity(&config, &track, Some(&meta), &timeline);
         assert_eq!(paused["details"], playing["details"]);
         assert_eq!(paused["assets"], playing["assets"]);
-        assert_eq!(paused["state"], "⏸ 일시정지 • Megadeth • Rust In Peace");
+        assert_eq!(paused["state"], "⏸ Paused • Megadeth • Rust In Peace");
         assert!(paused.get("timestamps").is_none());
         assert!(paused["assets"].get("large_text").is_none());
         track.status = Playback::Playing;

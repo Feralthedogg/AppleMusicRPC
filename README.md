@@ -26,7 +26,7 @@ On Windows, the Go app reads Apple Music via SMTC. On macOS, the native Rust app
 
 Requires macOS 12 or later. Building requires Rust 1.88 or later and Xcode Command Line Tools. The built app does not require Go, Rust, or a separate runtime.
 
-Download the [macOS v2.0.2 app for Apple Silicon](https://github.com/Feralthedogg/AppleMusicRPC/releases/download/v2.0.2/AppleMusicRPC-2.0.2-macos-arm64.zip), unzip it, and move `AppleMusicRPC.app` to Applications. This release uses ad hoc signing and is not notarized by Apple. Intel Macs can build the app from source.
+Download the [macOS v2.0.3 app for Apple Silicon](https://github.com/Feralthedogg/AppleMusicRPC/releases/download/v2.0.3/AppleMusicRPC-2.0.3-macos-arm64.zip), unzip it, and move `AppleMusicRPC.app` to Applications. This release uses ad hoc signing and is not notarized by Apple. Intel Macs can build the app from source.
 
 Build the app bundle:
 
@@ -84,7 +84,7 @@ Create a release ZIP and SHA-256 checksum for the build machine's architecture:
 
 macOS retains the existing JSON fields. `large_text` is ignored on macOS so Discord displays the album only once, in the artist/album line. `country` selects the Apple storefront; an empty value uses the macOS locale. `fallback_countries` defaults to `["KR", "US", "JP", "GB"]` for releases unavailable in the first storefront. No IP geolocation service is required. Set `AMRPC_CONFIG` or pass `--config PATH` to select a configuration explicitly.
 
-On macOS, `show_paused` defaults to `true`: pausing keeps the current song and cover visible with `⏸ 일시정지` (Paused), and removes the running progress timer until playback resumes. Set it to `false` to hide the activity while paused. Existing configurations are preserved during updates, so change this field to `true` if an older installation hides paused music.
+On macOS, `show_paused` defaults to `true`: pausing keeps the current song and cover visible with `⏸ Paused`, and removes the running song progress timer until playback resumes. The [Discord activity API](https://docs.discord.com/developers/events/gateway-events#activity-object) exposes start/end timestamps without a timer pause control and limits activity updates to five per 20 seconds. Repeated timestamp corrections every 0.8 seconds cannot reliably freeze the native bar for other users. Set `show_paused` to `false` to hide the activity while paused. Existing configurations are preserved during updates, so change this field to `true` if an older installation hides paused music.
 
 The cover reader calls `MRNowPlayingRequest.requestNowPlayingItemArtworkWithCompletion:` and receives `MRArtwork.imageData` through the system's Apple-signed `osascript` host. Photos stay on the Mac. Music's image URL caches are opened read-only; matching HEIC images are decoded with Apple's image codec, and only verified public Apple image URLs are sent to Discord. This private native API may change with macOS updates; the Music scripting artwork getter remains a fallback.
 
