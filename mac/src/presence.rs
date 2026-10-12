@@ -61,10 +61,19 @@ fn truncate(value: &str) -> String {
 }
 
 pub fn activity(config: &Config, track: &Track, meta: Option<&Meta>, timeline: &Timeline) -> Value {
-    let state = match (track.artist.is_empty(), track.album.is_empty()) {
+    let metadata = match (track.artist.is_empty(), track.album.is_empty()) {
         (false, false) => format!("{} • {}", track.artist, track.album),
         (false, true) => track.artist.clone(),
         _ => track.album.clone(),
+    };
+    let state = if track.status == Playback::Paused {
+        if metadata.is_empty() {
+            "⏸ 일시정지".into()
+        } else {
+            format!("⏸ 일시정지 • {metadata}")
+        }
+    } else {
+        metadata
     };
     let mut activity = json!({"name": "Apple Music", "type": 2, "details": truncate(&track.title), "state": truncate(&state)});
     if track.status == Playback::Playing
@@ -96,6 +105,50 @@ pub fn activity(config: &Config, track: &Track, meta: Option<&Meta>, timeline: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pause_keeps_song_and_cover_and_resume_restores_progress() {
+        let config = Config::default();
+        let mut track = Track {
+            status: Playback::Playing,
+            title: "Tornado of Souls".into(),
+            artist: "Megadeth".into(),
+            album: "Rust In Peace".into(),
+            position: 24.0,
+            duration: 319.0,
+            ..Track::default()
+        };
+        let meta = Meta {
+            cover_url: "https://is1-ssl.mzstatic.com/image/thumb/Music/cover/512x512bb.jpg".into(),
+            track_url: String::new(),
+            album: track.album.clone(),
+            track_id: 0,
+            collection_id: 0,
+            country: "KR".into(),
+            verification: "native-photo-and-music-cache".into(),
+            image_difference: Some(0.0),
+            image_source: "mediaremote-artwork-callback".into(),
+        };
+        let mut timeline = Timeline::default();
+        timeline.update(&track, 1000.0, true);
+        let playing = activity(&config, &track, Some(&meta), &timeline);
+        track.status = Playback::Paused;
+        timeline.update(&track, 1001.0, false);
+        let paused = activity(&config, &track, Some(&meta), &timeline);
+        assert_eq!(paused["details"], playing["details"]);
+        assert_eq!(paused["assets"], playing["assets"]);
+        assert_eq!(paused["state"], "⏸ 일시정지 • Megadeth • Rust In Peace");
+        assert!(paused.get("timestamps").is_none());
+        assert!(paused["assets"].get("large_text").is_none());
+        track.status = Playback::Playing;
+        timeline.update(&track, 1100.0, false);
+        let resumed = activity(&config, &track, Some(&meta), &timeline);
+        assert_eq!(resumed["details"], playing["details"]);
+        assert_eq!(resumed["assets"], playing["assets"]);
+        assert_eq!(resumed["state"], "Megadeth • Rust In Peace");
+        assert_eq!(resumed["timestamps"]["start"], 1076);
+        assert_eq!(resumed["timestamps"]["end"], 1395);
+    }
 
     #[test]
     fn timestamps_are_stable_and_correct_after_pause_resume_and_seek() {

@@ -335,7 +335,14 @@ pub fn run(
             let track_text = status
                 .track
                 .as_ref()
-                .map(|t| format!("{} — {}", t.artist, t.title))
+                .map(|t| {
+                    let prefix = if t.status == Playback::Paused {
+                        "Paused · "
+                    } else {
+                        ""
+                    };
+                    format!("{prefix}{} — {}", t.artist, t.title)
+                })
                 .unwrap_or_else(|| "Waiting for Music…".into());
             menu.update(
                 &track_text,

@@ -1,6 +1,6 @@
 use crate::model::{Playback, Track, clean};
 use anyhow::{Context, Result, bail};
-use objc2::{AnyThread, MainThreadMarker, rc::Retained, runtime::AnyObject};
+use objc2::{AnyThread, MainThreadMarker, msg_send, rc::Retained, runtime::AnyObject};
 use objc2_foundation::{NSAppleEventDescriptor, NSAppleScript, NSDictionary, NSLocale, NSString};
 
 const POLL: &str = r#"
@@ -91,11 +91,14 @@ fn compile(source: &str) -> Result<Retained<NSAppleScript>> {
 
 fn execute(script: &NSAppleScript) -> Result<Retained<NSAppleEventDescriptor>> {
     let mut error: Option<Retained<NSDictionary<NSString, AnyObject>>> = None;
-    let result = unsafe { script.executeAndReturnError(Some(&mut error)) };
+    // Foundation documents a nil result on execution failure, despite the
+    // generated binding's non-null return type. Keep errors recoverable.
+    let result: Option<Retained<NSAppleEventDescriptor>> =
+        unsafe { msg_send![script, executeAndReturnError: Some(&mut error)] };
     if let Some(error) = error {
         bail!("Music automation failed: {}", error.description());
     }
-    Ok(result)
+    result.context("Music automation returned no result")
 }
 
 fn text(result: &NSAppleEventDescriptor, index: isize) -> String {

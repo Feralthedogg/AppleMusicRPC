@@ -1,6 +1,6 @@
 [package]
 name = "apple-music-rpc"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2024"
 rust-version = "1.88"
 license = "BSD-3-Clause"
